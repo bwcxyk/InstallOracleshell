@@ -1,6 +1,39 @@
+# 作者简介
+> - 作者：LuciferLiu，中国DBA联盟(ACDU)成员。
+>- 目前从事Oracle DBA工作，曾从事 Oracle 数据库开发工作，主要服务于生产制造，汽车金融等行业。
+>- 现拥有Oracle OCP，OceanBase OBCA认证，擅长Oracle数据库运维开发，备份恢复，安装迁移，Linux自动化运维脚本编写等。
+
+![镇楼](https://img-blog.csdnimg.cn/20210630010923263.png)
 # 前言
 作为IT人，相信大家多多少少都接触使用过Oracle数据库，但是很少有人安装过Oracle数据库，因为这种活一般都是DBA干的，比如博主😬。那么，如果自己想安装一套Oracle数据库进行测试，如何安装呢？
 
+- **首先想要成功安装一套Oracle数据库，至少需要满足以下几个条件：**
+
+> - 了解基础的硬件资源配置：硬盘，内存，CPU等
+>- 熟悉如何安装Linux系统，包括多种虚拟机的使用
+>- 熟悉Linux常用命令和系统服务
+>- 熟悉Oracle数据库的整体安装流程，可参考官方文档
+
+- **具体步骤可以参考：**
+
+> - 安装Linux操作系统
+>- 配置存储，网络
+>- 配置操作系统服务和参数等
+>- 配置Oracle相关用户目录等
+>- 上传解压安装介质
+>- 安装Oracle软件
+>- 创建数据库实例
+   ![安装部署流程](https://img-blog.csdnimg.cn/20210613232723502.png)
+- **可参考文档：**
+
+> - [Windows主机如何玩转虚拟机Linux安装](https://blog.csdn.net/m0_50546016/article/details/117415206)
+>- [教你三步在MacOS上安装Linux系统](https://blog.csdn.net/m0_50546016/article/details/117414290)
+>- [手把手教你Linux安装Oracle数据库](https://blog.csdn.net/m0_50546016/article/details/117413992)
+>- [一步步教你Linux7安装Oracle RAC](https://luciferliu.blog.csdn.net/article/details/117857145)
+
+如果本篇文章只是如此，不免过于标题党，俗话说的好，抛转引玉，接下来就介绍下本文的主角：
+- **<font color='red'>Oracle一键安装脚本</font>，建库只需短短一行命令，一杯茶的功夫，敲代码的同时也不忘养生。**
+  ![Oracle一键安装](https://img-blog.csdnimg.cn/20210630010805285.png)
 # 一、介绍
 俗说得好：**<font color='#f47920'>"懒人"推动世界的发展。</font>** 既然能用脚本解决的事情，为什么还要那么麻烦，干就完事儿了。
 
