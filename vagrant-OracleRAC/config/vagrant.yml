@@ -1,0 +1,68 @@
+# -----------------------------------------------
+# vagrant.yml for VirtualBox
+# -----------------------------------------------
+node1:
+  vm_node: 1
+  #vm_name: rac01
+  mem_size: 2048
+  cpus: 2
+  public_ip:  192.168.56.200
+  vip_ip:     192.168.56.202
+  private_ip: 1.1.1.1
+  # u01_disk: ./node1_u01.vdi
+
+node2:
+  vm_node: 2
+  #vm_name: rac02
+  mem_size: 2048
+  cpus: 2
+  public_ip:  192.168.56.201
+  vip_ip:     192.168.56.203
+  private_ip: 1.1.1.2
+  # u01_disk: ./node2_u01.vdi
+
+asm:
+  # cluster_name & scan_name
+  prefix_name: orcl
+  # ---------------------------------------------
+  # domain  : localdomain
+  scan_ip1: 192.168.56.205
+  # scan_ip2: 192.168.56.116
+  # scan_ip3: 192.168.56.117
+  # ---------------------------------------------
+  non_rotational: 'on'
+  asm_disk_path:
+
+  # ocr
+  asm_ocr_num: 1
+  # unit: G
+  asm_ocr_size: 10
+  # num must match redun , 1, 3, 5 to EXTERNAL, NORMAL, HIGH
+  asm_ocr_redun: EXTERNAL
+
+  # data
+  asm_data_num: 1
+  # unit: G
+  asm_data_size: 10
+  # num must match redun , 1, 2, 3 to EXTERNAL, NORMAL, HIGH
+  asm_data_redun: EXTERNAL
+  # ---------------------------------------------
+
+env:
+  provider: virtualbox
+  # db version: 11/12/18/19
+  db_version: '11'
+  grid_patch: 31718723
+  db_patch:
+  # ---------------------------------------------
+  # User Password
+  root_password:   oracle
+  grid_password:   oracle
+  oracle_password: oracle
+  sys_password:    oracle
+  pdb_password:    oracle
+  # ---------------------------------------------
+  db_name:         orcl
+  pdb_name:        PDB1
+  cdb:             false
+  # ---------------------------------------------

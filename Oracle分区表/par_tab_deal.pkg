@@ -1,0 +1,625 @@
+CREATE OR REPLACE PACKAGE pkg_deal_part_tab AUTHID CURRENT_USER AS
+
+  /*
+    
+    增加外键约束功能
+    增加自动建索引功能(当前只是处理普通索引，含唯一和非唯一索引，但是不含函数索引）
+    能通过p_struct_only参数来决定新建的表是否只是结构，还是需要把数据CREATE过来
+    索引指定索引表空间
+    将唯一索引和普通索引两个小过程合并为一个
+    原先的外键依赖有BUG，未考虑联合外键和联合组键相关的情况，修正p_deal_constraint代码
+
+    功能： 实现普通表到分区表自动改造工作
+
+    参数含义：
+      p_tab in varchar2,                 -----------------需要进行分区的普通表的表名
+      p_deal_flag in number default 0,   -----------------0为不执行，只将脚本记录进part_tab_log的sql_text字段中，1为不仅记录，而且执行！
+      p_parallel in number default 4,    -----------------分区操作中的并行度，默认为4
+      p_part_colum in varchar2,          -----------------需要分区的列，本程序主要针对最常见的时间范围类型分区，按月份分区
+      p_part_nums in number default 24,  -----------------默认情况下为最近一个月到后续24个月，可以自行选择
+      p_tablespace IN VARCHAR2           -----------------分区表的表空间
+
+    处理逻辑分为如下几个程序：
+      P_RENAME (p_tab); ---将原表先RENAME为YYYYMMDD的后缀名的表
+      p_ctas (p_tab ,p_deal_flag, p_part_colum,p_parallel ,p_tablespace ); ---CTAS建立分区表
+      p_deal_comments(p_tab,p_deal_flag);  --增加分区表的注释
+      p_deal_default (p_tab,p_deal_flag);  --增加分区表的默认值判断
+      p_deal_check   (p_tab,p_deal_flag);  --增加分区表的CHECK判断
+      P_DROP_CONS_IDX(P_TAB||YYYYMMDD,p_deal_flag); ---将RENAME后的表的索引和约束删除，以方便新表建索引和约束不会冲突
+
+  -------------------------------------------------------------------------------------------------------------------------------
+    注意：
+      1. PART_TAB_LOG是用来记录操作日志的
+      create table PART_TAB_LOG
+       (
+        TAB_NAME    VARCHAR2(200),
+        DEAL_MODEL   VARCHAR2(200),
+        SQL_TEXT     clob,
+        DEAL_TIME    DATE,
+        remark       VARCHAR2(4000),
+        exec_order1   number,
+        exec_order2  number
+       );
+
+       2.在不执行脚本，只获取脚本时，脚本可以用如下方式获取，并手工执行
+       select DBMS_LOB.SUBSTR(sql_text,1000)||';' from part_tab_log t where tab_name='CUS_LENOVO_ATEUPLOAD_LOG' order by exec_order1,exec_order2;
+       select sql_text||';' from part_tab_log t where tab_name='ts_real_datatrance' order by exec_order1,exec_order2;
+
+   ------------------------------------------------------------------------------------------------------------------------------
+     执行方法：
+       set serveroutput on size 1000000
+       exec pkg_deal_part_tab.p_main(p_tab => 'ts_real_datatrance', p_deal_flag => 1, p_parallel => 4, p_part_colum => 'trans_date',p_part_nums=> 24,p_tab_tablespace => 'TBS_BOSSWG',p_idx_tablespace => 'TBS_BOSSWG');
+
+     或者可以如下让p_deal_flag => 0，只将执行脚本记录进part_tab_log表中，而并不真正执行
+       set serveroutput on size 1000000
+       exec pkg_deal_part_tab.p_main(p_tab => 'ts_real_datatrance', p_deal_flag => 0, p_parallel => 4, p_part_colum => 'trans_date',p_part_nums=> 24,p_tab_tablespace => 'TBS_BOSSWG',p_idx_tablespace => 'TBS_BOSSWG');
+  ----------------------------------------------------------------------------------------------------------------------------------
+  */
+
+  PROCEDURE p_rename(p_tab IN VARCHAR2);
+  PROCEDURE p_ctas(p_tab         IN VARCHAR2,
+                   p_struct_only IN NUMBER,
+                   p_deal_flag   IN NUMBER,
+                   p_part_colum  IN VARCHAR2,
+                   p_part_nums   IN NUMBER DEFAULT 24,
+                   p_parallel    IN NUMBER DEFAULT 4,
+                   p_tablespace  IN VARCHAR2);
+  PROCEDURE p_deal_tab_comments(p_tab       IN VARCHAR2,
+                                p_deal_flag IN NUMBER);
+  PROCEDURE p_deal_col_comments(p_tab       IN VARCHAR2,
+                                p_deal_flag IN NUMBER);
+  PROCEDURE p_deal_default_and_nullable(p_tab       IN VARCHAR2,
+                                        p_deal_flag IN NUMBER);
+  PROCEDURE p_deal_check(p_tab       IN VARCHAR2,
+                         p_deal_flag IN NUMBER);
+  PROCEDURE p_deal_pk(p_tab       IN VARCHAR2,
+                      p_deal_flag IN NUMBER);
+  PROCEDURE p_deal_constraint(p_tab       IN VARCHAR2,
+                              p_deal_flag IN NUMBER);
+  PROCEDURE p_rename_normal_idx(p_tab            IN VARCHAR2,
+                                p_deal_flag      IN NUMBER,
+                                p_idx_tablespace IN VARCHAR2);
+  PROCEDURE p_main(p_tab            IN VARCHAR2,
+                   p_deal_flag      IN NUMBER DEFAULT 0,
+                   p_parallel       IN NUMBER DEFAULT 4,
+                   p_part_colum     IN VARCHAR2,
+                   p_part_nums      IN NUMBER DEFAULT 24,
+                   p_struct_only    IN NUMBER DEFAULT 0,
+                   p_tab_tablespace IN VARCHAR2,
+                   p_idx_tablespace IN VARCHAR2);
+
+END pkg_deal_part_tab;
+/
+CREATE OR REPLACE PACKAGE BODY pkg_deal_part_tab AS
+  yyyymmdd     VARCHAR2(50) := to_char(trunc(SYSDATE),
+                                       'dd');
+  v_cnt_re_tab NUMBER(9) := 0;
+  v_sql        VARCHAR2(32767);
+  v_first_day  DATE;
+  v_next_day   DATE;
+  v_prev_day   DATE;
+  v_length     NUMBER;
+  v_min_date   DATE;
+  v_partiton   VARCHAR2(4000);
+  v_partitons  VARCHAR2(32767);
+  PROCEDURE p_insert_log(p_tab         IN VARCHAR2,
+                         v_deal_model  IN VARCHAR2,
+                         v_sql_text    IN CLOB,
+                         v_remark      IN VARCHAR2 DEFAULT NULL,
+                         v_exec_order1 NUMBER DEFAULT 0,
+                         v_exec_order2 NUMBER DEFAULT 0) AS
+    /*
+     功能：记录日志，将各步骤中拼的SQL保存起来
+    */
+  BEGIN
+    INSERT INTO part_tab_log
+      (tab_name,
+       deal_model,
+       sql_text,
+       deal_time,
+       remark,
+       exec_order1,
+       exec_order2)
+    VALUES
+      (p_tab,
+       v_deal_model,
+       v_sql_text,
+       SYSDATE,
+       v_remark,
+       v_exec_order1,
+       v_exec_order2);
+    COMMIT;
+  END p_insert_log;
+
+  PROCEDURE p_if_judge(v_sql       IN VARCHAR2,
+                       p_deal_flag IN NUMBER) AS
+    /*
+     功能：在获取到V_SQL的动态SQL后，是否EXECUTE IMMEDIATE执行前做一个判断，
+           根据p_deal_flag的入参而定，0为不执行，非0为执行
+    */
+  BEGIN
+    IF p_deal_flag = 0 THEN
+      NULL;
+    ELSE
+      EXECUTE IMMEDIATE (v_sql);
+    END IF;
+  END p_if_judge;
+
+  PROCEDURE p_rename(p_tab IN VARCHAR2) AS
+    /*
+     功能：将原表重命名为_yyyymmdd格式的表名
+    */
+  BEGIN
+    SELECT COUNT(*)
+      INTO v_cnt_re_tab
+      FROM user_objects
+     WHERE object_name = upper(p_tab || yyyymmdd);
+    IF v_cnt_re_tab = 0 THEN
+      v_sql := 'RENAME ' || p_tab || ' TO ' || p_tab || '_' || yyyymmdd;
+      p_insert_log(p_tab,
+                   'P_RENAME',
+                   v_sql,
+                   '完成原表的重命名，改为_YYYYMMDD形式',
+                   1);
+      EXECUTE IMMEDIATE (v_sql); --这里无需做判断，rename动作真实完成！如果后续只是为生成脚本而不是真实执行分区操作，最后再把这个表RENAME回去！
+    ELSE
+      dbms_output.put_line('备份表' || p_tab || '_' || yyyymmdd || '已存在');
+    END IF;
+    dbms_output.put_line('将' || p_tab || ' 表RENMAE成 ' || p_tab || '_' || yyyymmdd || '，并删除其约束索引等');
+  END p_rename;
+
+  PROCEDURE p_ctas(p_tab         IN VARCHAR2,
+                   p_struct_only IN NUMBER,
+                   p_deal_flag   IN NUMBER,
+                   p_part_colum  IN VARCHAR2,
+                   p_part_nums   IN NUMBER DEFAULT 24,
+                   p_parallel    IN NUMBER DEFAULT 4,
+                   p_tablespace  IN VARCHAR2) AS
+    /*
+     功能：用CREATE TABLE AS SELECT 的方式从RENAME的_yyyymmdd表中新建出一个只有MAXVALUE的初步分区表
+    */
+  BEGIN
+    v_sql := 'SELECT MIN(' || p_part_colum || ') FROM ' || p_tab || '_' || yyyymmdd;
+    p_insert_log(p_tab,
+                 'p_ctas',
+                 v_sql,
+                 '分区表获取分区列最小日期',
+                 2,
+                 0);
+    EXECUTE IMMEDIATE (v_sql)
+      INTO v_min_date;
+
+    SELECT to_date(to_char(v_min_date,
+                           'yyyymm') || '01',
+                   'yyyymmdd')
+      INTO v_first_day
+      FROM dual;
+
+    FOR i IN 1 .. p_part_nums
+    LOOP
+      SELECT add_months(v_first_day,
+                        i)
+        INTO v_next_day
+        FROM dual;
+      SELECT add_months(v_next_day,
+                        -1)
+        INTO v_prev_day
+        FROM dual;
+      v_partiton  := 'PARTITION ' || p_tab || '_P' || to_char(v_prev_day,
+                                                              'yyyymm') || ' VALUES LESS THAN (TO_DATE(''' ||
+                     to_char(v_next_day,
+                             'SYYYY-MM-DD HH24:MI:SS') || ''', ''SYYYY-MM-DD HH24:MI:SS'', ''NLS_CALENDAR=GREGORIAN'')) TABLESPACE ' || p_tablespace || ',' ||
+                     chr(13) || chr(10);
+      v_partitons := v_partitons || v_partiton;
+    END LOOP;
+
+    v_sql := 'CREATE TABLE ' || p_tab || ' PARTITION BY RANGE(' || p_part_colum || ')(' || v_partitons || 'PARTITION ' || p_tab ||
+             '_MAX VALUES LESS THAN (MAXVALUE) TABLESPACE ' || p_tablespace || ')
+             NOLOGGING
+             PARALLEL 8
+             ENABLE ROW MOVEMENT
+             TABLESPACE ' || p_tablespace || '
+             AS SELECT /*+PARALLEL(t,' || p_parallel || ')*/ *
+      FROM ' || p_tab || '_' || yyyymmdd;
+    IF p_struct_only = 0 THEN
+      v_sql := v_sql || ' t WHERE 1=2';
+    ELSE
+      v_sql := v_sql || ' t WHERE 1=1';
+    END IF;
+    p_insert_log(p_tab,
+                 'p_ctas',
+                 v_sql,
+                 '完成CTAS建初步分区表',
+                 2,
+                 1);
+    p_if_judge(v_sql,
+               p_deal_flag);
+
+    v_sql := 'ALTER TABLE ' || p_tab || ' LOGGING';
+    p_insert_log(p_tab,
+                 'p_ctas',
+                 v_sql,
+                 '将新分区表修改回LOGGING属性',
+                 2,
+                 2);
+    p_if_judge(v_sql,
+               p_deal_flag);
+
+    v_sql := 'ALTER TABLE ' || p_tab || ' NOPARALLEL';
+    p_insert_log(p_tab,
+                 'p_ctas',
+                 v_sql,
+                 '将新分区表修改回NOPARALLEL属性',
+                 2,
+                 3);
+    p_if_judge(v_sql,
+               p_deal_flag);
+    dbms_output.put_line('通过CTAS的方式从 ' || p_tab || '_' || yyyymmdd || ' 中新建' || p_tab || '表，完成初步分区改造工作');
+  END p_ctas;
+
+  PROCEDURE p_deal_tab_comments(p_tab       IN VARCHAR2,
+                                p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到表和字段的注释，为新分区表的表名和字段增加注释
+    */
+  BEGIN
+    FOR i IN (SELECT *
+                FROM user_tab_comments
+               WHERE table_name = upper(p_tab) || '_' || yyyymmdd)
+    LOOP
+      v_sql := 'COMMENT ON TABLE ' || p_tab || ' IS ' || '''' || i.comments || '''';
+      p_insert_log(p_tab,
+                   'p_deal_comments',
+                   v_sql,
+                   '将新分区表的表的注释加上',
+                   4,
+                   1);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '表增加表名的注释内容');
+  END p_deal_tab_comments;
+
+  PROCEDURE p_deal_col_comments(p_tab       IN VARCHAR2,
+                                p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到表和字段的注释，为新分区表的表名和字段增加注释
+    */
+  BEGIN
+    FOR i IN (SELECT *
+                FROM user_col_comments
+               WHERE table_name = upper(p_tab) || '_' || yyyymmdd)
+    LOOP
+      v_sql := 'COMMENT ON COLUMN ' || p_tab || '.' || i.column_name || ' IS ' || '''' || i.comments || '''';
+      p_insert_log(p_tab,
+                   'p_deal_col_comments',
+                   v_sql,
+                   '将新分区表的列的注释加上',
+                   4,
+                   2);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+
+    dbms_output.put_line('对' || p_tab || '表增加列名及字段的注释内容');
+  END p_deal_col_comments;
+
+  PROCEDURE p_deal_default_and_nullable(p_tab       IN VARCHAR2,
+                                        p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到原表的DEFAULT值，为新分区表的表名和字段增加DEFAULT值
+    */
+  BEGIN
+    FOR i IN (SELECT *
+                FROM user_tab_columns
+               WHERE table_name = upper(p_tab) || '_' || yyyymmdd
+                 AND data_default IS NOT NULL)
+    LOOP
+      v_sql := 'ALTER TABLE ' || p_tab || ' MODIFY ' || i.column_name || ' DEFAULT ' || i.data_default;
+      p_insert_log(p_tab,
+                   'p_deal_default',
+                   v_sql,
+                   '将新分区表的默认值加上',
+                   5);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '表完成默认DEFAULT值的增加');
+  END p_deal_default_and_nullable;
+
+  PROCEDURE p_deal_check(p_tab       IN VARCHAR2,
+                         p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到原表的CHECK值，为新分区表增加CHECK值
+     另注：
+      user_constraints已经包行了非空的判断，可以略去如下类似的从user_tab_columns获取非空判断的代码编写来判断是否
+      for i in (select * from user_tab_columns where table_name=UPPER(P_TAB)||'_'||YYYYMMDD and nullable='N') loop
+       v_sql:='alter table '||p_tab||' modify '||i.COLUMN_NAME ||' not null';
+    */
+  BEGIN
+    FOR i IN (SELECT *
+                FROM user_constraints
+               WHERE table_name = upper(p_tab) || '_' || yyyymmdd
+                 AND constraint_type = 'C')
+    LOOP
+      v_sql := 'ALTER TABLE ' || p_tab || '_' || yyyymmdd || ' DROP CONSTRAINT ' || i.constraint_name;
+      p_insert_log(p_tab,
+                   'p_deal_check',
+                   v_sql,
+                   '将备份出来的原表的CHECK删除',
+                   6,
+                   1);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+      v_sql := 'ALTER TABLE ' || p_tab || ' ADD CONSTRAINT ' || i.constraint_name || ' CHECK (' || i.search_condition || ')';
+      p_insert_log(p_tab,
+                   'p_deal_check',
+                   v_sql,
+                   '将新分区表的CHECK加上',
+                   6,
+                   2);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '完成CHECK的约束');
+  END p_deal_check;
+
+  PROCEDURE p_deal_pk(p_tab       IN VARCHAR2,
+                      p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到原表的主键信息，为新分区表增加主键值，并删除旧表主键
+    */
+  BEGIN
+    FOR i IN (WITH t AS
+                 (SELECT index_name,
+                        table_name,
+                        column_name
+                   FROM user_ind_columns
+                  WHERE index_name IN (SELECT index_name
+                                         FROM sys.user_constraints t
+                                        WHERE table_name = upper(p_tab) || '_' || yyyymmdd
+                                          AND constraint_type = 'P'))
+                SELECT index_name,
+                       table_name,
+                       MAX(substr(sys_connect_by_path(column_name,
+                                                      ','),
+                                  2)) str
+                  FROM (SELECT column_name,
+                               index_name,
+                               table_name,
+                               row_number() over(PARTITION BY index_name, table_name ORDER BY column_name) rn
+                          FROM t) t
+                 START WITH rn = 1
+                CONNECT BY rn = PRIOR rn + 1
+                       AND index_name = PRIOR index_name
+                 GROUP BY index_name,
+                          t.table_name)
+    LOOP
+      v_sql := 'ALTER TABLE ' || i.table_name || ' DROP CONSTRAINT ' || i.index_name || ' CASCADE';
+      p_insert_log(p_tab,
+                   'p_deal_pk',
+                   v_sql,
+                   '将备份出来的原表的主键删除',
+                   7,
+                   1);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+      v_sql := 'ALTER TABLE ' || p_tab || ' ADD CONSTRAINT ' || i.index_name || ' PRIMARY KEY (' || i.str || ')';
+      p_insert_log(p_tab,
+                   'p_deal_pk',
+                   v_sql,
+                   '将新分区表的主键加上',
+                   7,
+                   2);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '完成主键的增加');
+  END p_deal_pk;
+
+  PROCEDURE p_deal_constraint(p_tab       IN VARCHAR2,
+                              p_deal_flag IN NUMBER) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到原表的约束，为新分区表增加约束值，并删除旧表约束
+    */
+  BEGIN
+    FOR i IN (WITH t1 AS
+                 (SELECT /*+no_merge */
+                  position,
+                  t.owner,
+                  t.constraint_name AS constraint_name1,
+                  t.table_name      AS table_name1,
+                  t.column_name     AS column_name1
+                   FROM user_cons_columns t
+                  WHERE constraint_name IN (SELECT constraint_name
+                                              FROM user_constraints
+                                             WHERE table_name = upper(p_tab) || '_' || yyyymmdd
+                                               AND constraint_type = 'R')),
+                t2 AS
+                 (SELECT /*+no_merge */
+                  t.position,
+                  c.constraint_name constraint_name1,
+                  t.constraint_name AS constraint_name2,
+                  t.table_name AS table_name2,
+                  t.column_name AS column_name2,
+                  MAX(t.position) over(PARTITION BY c.constraint_name) max_position
+                   FROM user_cons_columns t,
+                        user_constraints  c
+                  WHERE c.table_name = upper(p_tab) || '_' || yyyymmdd
+                    AND t.constraint_name = c.r_constraint_name
+                    AND c.constraint_type = 'R'),
+                t3 AS
+                 (SELECT t1.*,
+                        t2.constraint_name2,
+                        t2.table_name2,
+                        t2.column_name2,
+                        t2.max_position
+                   FROM t1,
+                        t2
+                  WHERE t1.constraint_name1 = t2.constraint_name1
+                    AND t1.position = t2.position)
+                SELECT t3.*,
+                       substr(sys_connect_by_path(column_name1,
+                                                  ','),
+                              2) AS fk,
+                       substr(sys_connect_by_path(column_name2,
+                                                  ','),
+                              2) AS pk
+                  FROM t3
+                 WHERE position = max_position
+                 START WITH position = 1
+                CONNECT BY constraint_name1 = PRIOR constraint_name1
+                       AND position = PRIOR position + 1)
+    LOOP
+      v_sql := 'ALTER TABLE ' || p_tab || '_' || yyyymmdd || ' DROP CONSTRAINT ' || i.constraint_name1;
+      p_insert_log(p_tab,
+                   'p_deal_constraint',
+                   v_sql,
+                   '删除原表FK外键',
+                   8,
+                   1);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+      v_sql := 'ALTER TABLE ' || p_tab || ' ADD CONSTRAINT ' || i.constraint_name1 || ' FOREIGN KEY ( ' || i.fk || ') REFERENCES ' || i.table_name2 || ' (' || i.pk || ' )';
+      p_insert_log(p_tab,
+                   'p_deal_constraint',
+                   v_sql,
+                   '将新分区表的外键加上',
+                   8,
+                   2);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '完成外键的增加');
+  END p_deal_constraint;
+
+  PROCEDURE p_rename_normal_idx(p_tab            IN VARCHAR2,
+                                p_deal_flag      IN NUMBER,
+                                p_idx_tablespace IN VARCHAR2) AS
+    /*
+     功能：从_YYYYMMDD备份表中得到原表的索引信息，为新分区表增加普通索引（唯一和非唯一索引，函数索引暂不考虑），并rename旧表索引
+    */
+  BEGIN
+    FOR i IN (WITH t AS
+                 (SELECT c.*,
+                        i.uniqueness
+                   FROM user_ind_columns c,
+                        (SELECT DISTINCT index_name,
+                                         uniqueness
+                           FROM user_indexes
+                          WHERE table_name = upper(p_tab) || '_' || yyyymmdd
+                            AND index_type = 'NORMAL'
+                            AND index_name NOT IN (SELECT constraint_name
+                                                     FROM user_constraints)) i
+                  WHERE c.index_name = i.index_name)
+                SELECT index_name,
+                       table_name,
+                       uniqueness,
+                       MAX(substr(sys_connect_by_path(column_name,
+                                                      ','),
+                                  2)) str
+                  FROM (SELECT column_name,
+                               index_name,
+                               table_name,
+                               row_number() over(PARTITION BY index_name, table_name ORDER BY column_name) rn,
+                               uniqueness
+                          FROM t) t
+                 START WITH rn = 1
+                CONNECT BY rn = PRIOR rn + 1
+                       AND index_name = PRIOR index_name
+                 GROUP BY index_name,
+                          t.table_name,
+                          uniqueness)
+    LOOP
+      v_sql := 'ALTER INDEX ' || i.index_name || ' RENAME TO ' || i.index_name || '_' || yyyymmdd;
+      p_insert_log(p_tab,
+                   'p_rename_normal_idx',
+                   v_sql,
+                   'rename原表索引',
+                   9,
+                   1);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+      IF i.uniqueness = 'UNIQUE' THEN
+        v_sql := 'CREATE UNIQUE INDEX ' || i.index_name || ' ON ' || p_tab || '(' || i.str || ')' || ' TABLESPACE ' || p_idx_tablespace;
+      ELSIF i.uniqueness = 'NONUNIQUE' THEN
+        v_sql := 'CREATE INDEX ' || i.index_name || ' ON ' || p_tab || '(' || i.str || ')' || ' TABLESPACE ' || p_idx_tablespace ||
+                 ' PARALLEL 8 LOCAL';
+      END IF;
+      p_insert_log(p_tab,
+                   'p_rename_normal_idx',
+                   v_sql,
+                   '将新分区表的索引加上',
+                   9,
+                   2);
+      v_sql := 'ALTER INDEX ' || i.index_name || ' NOPARALLEL';
+      p_insert_log(p_tab,
+                   'p_rename_normal_idx',
+                   v_sql,
+                   '将新分区表的索引取消并行',
+                   10,
+                   2);
+      p_if_judge(v_sql,
+                 p_deal_flag);
+    END LOOP;
+    dbms_output.put_line('对' || p_tab || '完成新分区表索引的增加');
+  END p_rename_normal_idx;
+
+  PROCEDURE p_main(p_tab            IN VARCHAR2, --需要进行分区改造的表名
+                   p_deal_flag      IN NUMBER DEFAULT 0, --0为不执行，只将脚本记录进part_tab_log的sql_text字段中，1为不仅记录，而且执行！
+                   p_parallel       IN NUMBER DEFAULT 4, --并行度设置
+                   p_part_colum     IN VARCHAR2, --需要分区的列（时间范围分区）
+                   p_part_nums      IN NUMBER DEFAULT 24, --需要分区的分区数
+                   p_struct_only    IN NUMBER DEFAULT 0, --新表是否是只建表结构不导入数据，0为只建结构，非0如1等值，为导数据
+                   p_tab_tablespace IN VARCHAR2, --分区的表空间
+                   p_idx_tablespace IN VARCHAR2) --分区的表空间
+   AS
+    /*
+     功能：判断表名是否超过25位，超过则提示并且退出。
+    */
+  BEGIN
+    SELECT length(p_tab)
+      INTO v_length
+      FROM dual;
+    IF v_length >= 28 THEN
+      dbms_output.put_line('需要转换的表名 ' || p_tab || ' 已超过28位字符，无法使用该脚本进行转换操作！');
+    ELSE
+
+      DELETE FROM part_tab_log
+       WHERE tab_name = p_tab;
+      COMMIT;
+      p_rename(p_tab); ---将原表先RENAME为YYYYMMDD的后缀名的表
+      p_ctas(p_tab,
+             p_struct_only,
+             p_deal_flag,
+             p_part_colum,
+             p_part_nums,
+             p_parallel,
+             p_tab_tablespace); ---CTAS建立除部分分区的分区表
+      p_deal_tab_comments(p_tab,
+                          p_deal_flag); --增加分区表的表注释
+      p_deal_col_comments(p_tab,
+                          p_deal_flag); --增加分区表的列注释
+      p_deal_default_and_nullable(p_tab,
+                                  p_deal_flag); --增加分区表的默认值
+      p_deal_check(p_tab,
+                   p_deal_flag); --增加分区表的CHECK
+      p_deal_pk(p_tab,
+                p_deal_flag); --增加分区表的主键
+      p_deal_constraint(p_tab,
+                        p_deal_flag); ---增加外键
+      p_rename_normal_idx(p_tab,
+                          p_deal_flag,
+                          p_idx_tablespace); --增加分区表的索引
+      IF p_deal_flag = 0 THEN
+        dbms_output.put_line('请特别留意!!!，以上只是对' || p_tab || '进行生成脚本动作，未真正执行分区改造等执行动作，脚本可从part_tab_log中获取');
+        dbms_output.put_line('如果需要真正完成执行动作，请将pkg_deal_part_tab.p_main的 p_deal_flag参数值设置为非0值，如1');
+        EXECUTE IMMEDIATE 'rename ' || p_tab || '_' || yyyymmdd || ' to ' || p_tab; --即便只获取脚本而无需执行，前面RENAME的动作也必须真实完成，因为很多数据字典信息要取自_YYYYMM表的信息，因此前面必须执行，只好在这里最后再RENAME替换回去
+      ELSE
+        dbms_output.put_line('对' || p_tab || '已经完成了操作分区改造等执行步骤，脚本可从part_tab_log中获取');
+      END IF;
+    END IF;
+  END p_main;
+
+END pkg_deal_part_tab;
+/
